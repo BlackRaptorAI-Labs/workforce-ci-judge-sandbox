@@ -1,0 +1,51 @@
+{
+  "enabledPlugins": {
+    "blackraptor-core@blackraptor-scratch": true,
+    "blackraptor-engineering@blackraptor-scratch": true,
+    "blackraptor-core@blackraptor": false,
+    "blackraptor-engineering@blackraptor": false,
+    "blackraptor-council@blackraptor": false,
+    "blackraptor-marketing@blackraptor": false,
+    "blackraptor-hardware@blackraptor": false
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/protect-tier3.py\""
+          }
+        ]
+      }
+    ]
+  },
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "allowUnsandboxedCommands": false,
+    "filesystem": {
+      "allowWrite": [
+        "./"
+      ],
+      "denyWrite": [
+        "./.claude/gates-allow.txt",
+        "./.claude/test-summary-patterns.txt",
+        "./.claude/live-commands-allow.txt",
+        "./.claude/workforce-installed.json",
+        "./.claude/review-copies.sha256",
+        "./.github/workflows/change-record-required.yml",
+        "./.github/workflows/workforce-proof.yml"
+      ]
+    }
+  },
+  "extraKnownMarketplaces": {
+    "blackraptor-scratch": {
+      "source": {
+        "source": "directory",
+        "path": "/private/var/folders/hb/vt7c2wg548j8v3r294x428vh0000gn/T/br-scratch-marketplace"
+      }
+    }
+  }
+}

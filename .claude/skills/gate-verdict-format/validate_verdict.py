@@ -1,0 +1,575 @@
+#!/usr/bin/env python3
+"""R11 verdict validator — the machine the governance layer was missing.
+
+Extracts every ```verdict fenced block from a file (a Change Record, or an agent's
+output) and validates each against verdict-schema.json — the schema is LOADED and
+ENFORCED (types, enums, required keys, additionalProperties, minItems, minLength,
+string `pattern`, and the verdict-conditional rules), not merely referenced. Hand-rolled against the schema
+JSON so it runs with no external deps (the CI runner and an orchestrator subagent
+both have plain python3, not necessarily `jsonschema`).
+
+  exit 0  — all verdict blocks present and well-formed
+  exit 1  — a malformed / missing-field / bad-type / extra-key / rubber-stamp block
+  exit 3  — no verdict blocks found (only an error when --require is passed)
+
+Also summarizes the aggregate gate state (all PASS / has CONCERNS / has FAIL) so an
+orchestrator can enforce "fail-closed until every gate shows PASS", and a FAIL
+surfaces the §5 risk-acceptance requirement.
+
+Usage: validate_verdict.py <file.md> [--require] [--json]
+       validate_verdict.py --cr-mode <change-record.md> [--require]
+
+--cr-mode (D-118, audit F5): the Change Record gate. On top of the checks above, a CR whose aggregate
+state is HAS_FAIL or HAS_COULD_NOT_ASSESS fails (exit 1) unless its "## 5. Deviations & risk
+acceptance" table has a row that accepts each FAIL / COULD NOT ASSESS gate (D-202): the "What" cell
+names the gate (its `gate` or `agent` value as a whole word, not a substring), "I decided" is
+ACCEPT-WITH-RISK or HUMAN-OVERRULES, and "Why acceptable" and "Approver" are filled (D-212: not n/a, none,
+TBD, ?, pending or todo, and the Approver is a person, not a gate or council slug). When several rows name
+one gate, every one of them must accept. A missing gate is still a missing gate: --cr-mode implies --require.
+"""
+import json
+import os
+import re
+import sys
+import tempfile
+from pathlib import Path
+
+# Indent-tolerant: a ```verdict fence nested under a list item / inside <details>
+# is indented. The CI (change-record-required.yml) shells out to THIS file, so there
+# is no second regex implementation to keep in sync.
+FENCE = re.compile(r"^[ \t]*```verdict[ \t]*\n(.*?)\n[ \t]*```", re.S | re.M)
+
+SCHEMA_PATH = Path(__file__).with_name("verdict-schema.json")
+
+# Gates whose PASS must rest on a run (schema v3.2): their evidence opens with MEASURED, or (v3.4, D-201)
+# with CITED, completion-auditor's output path and the backticked command that run executed. This file checks
+# the shape only: it cannot see the session. The Stop hook checks the run (D-211): a passing test run that a
+# completion-auditor dispatched in the same turn made.
+QUALITY_GATES = {"test-auditor", "completion-auditor"}
+QUALITY_CITED = re.compile(r"^CITED\s+[^\s`]*[/.][^\s`]*\s+`[^`]+`")
+
+# --cr-mode §5 (D-202): the decisions that accept a FAIL / COULD NOT ASSESS gate.
+ACCEPTING = {"ACCEPT-WITH-RISK", "HUMAN-OVERRULES"}
+
+# The exact literal strings the CR template ships. A copy that changes only
+# verdict '___' → PASS but leaves these is a two-character rubber stamp; reject them.
+TEMPLATE_PLACEHOLDERS = {
+    "file:line — basis",
+    "CITED file:line@sha — basis",   # the v3.1 Change Record form placeholder
+    "the one fact that would flip this",
+    "PR #___",
+    "PR #___ / <files>",
+    "...",
+    "___",
+}
+
+
+def load_schema():
+    try:
+        return json.loads(SCHEMA_PATH.read_text())
+    except Exception as e:  # a validator that can't load its schema must not pass silently
+        print(f"FATAL: cannot load verdict-schema.json ({e})", file=sys.stderr)
+        sys.exit(2)
+
+
+def _type_ok(val, jtype):
+    if jtype == "string":
+        return isinstance(val, str)
+    if jtype == "array":
+        return isinstance(val, list)
+    if jtype == "object":
+        return isinstance(val, dict)
+    if jtype == "integer":
+        # bool is a subclass of int in Python; `true` is not a confidence score.
+        return isinstance(val, int) and not isinstance(val, bool)
+    return True
+
+
+def _standards_item_errs(item, idx, i):
+    """schema v3 `standards[]`: either the literal no-standard string, or a full citation.
+
+    A designation with no access and no verification date is a memory, not a citation — the whole
+    point of the field. Both branches are checked here because the hand-rolled validator does not
+    implement oneOf generically."""
+    if isinstance(item, str):
+        if re.match(r"^none: practice applied: \S", item):
+            return []
+        return [f"block {idx}: standards[{i}] string must read "
+                f"'none: practice applied: <the practice>', got {item!r}"]
+    if not isinstance(item, dict):
+        return [f"block {idx}: standards[{i}] must be a citation object or the "
+                f"'none: practice applied: ...' string"]
+    errs = []
+    required = ("designation", "edition", "clause", "access", "verified")
+    for k in required:
+        if k not in item:
+            errs.append(f"block {idx}: standards[{i}] missing '{k}' "
+                        f"(a designation without {k} is not a citation)")
+        elif not isinstance(item[k], str) or not item[k].strip():
+            errs.append(f"block {idx}: standards[{i}].{k} must be a non-blank string")
+    for k in item:
+        if k not in required:
+            errs.append(f"block {idx}: standards[{i}] unknown key '{k}'")
+    v = item.get("verified")
+    if isinstance(v, str) and v.strip() and not re.match(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$", v):
+        errs.append(f"block {idx}: standards[{i}].verified must be YYYY-MM-DD, got {v!r}")
+    return errs
+
+
+def _repo_root(start):
+    """The first folder at or above `start` holding `.git` (a folder, a file or a link, even a dangling one;
+    D-213), or None within 25 levels."""
+    d = os.path.realpath(start)
+    for _ in range(25):
+        if os.path.lexists(os.path.join(d, ".git")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+    return None
+
+
+def _allowed_gates():
+    """Project gates from .claude/gates-allow.txt (one slug per line), found from the working directory upward
+    (D-192). The walk stops at the first folder holding `.git` (D-204; `.git` may be a dangling link, D-213): an
+    allow file above the repository is never read. CLAUDE_PROJECT_DIR is used only when it is the working
+    directory's repository root or a folder inside it (D-213); otherwise it is ignored."""
+    cwd = os.path.realpath(os.getcwd())
+    root, starts = _repo_root(cwd), []
+    env = os.environ.get("CLAUDE_PROJECT_DIR") or ""
+    if env and root:
+        e = os.path.realpath(env)
+        if e == root or e.startswith(root + os.sep):
+            starts.append(e)
+    starts.append(cwd)
+    for d in starts:
+        for _ in range(25):
+            f = os.path.join(d, ".claude", "gates-allow.txt")
+            if os.path.isfile(f):
+                try:
+                    return {l.strip() for l in open(f, encoding="utf-8") if l.strip() and not l.startswith("#")}
+                except OSError:
+                    return set()
+            if os.path.lexists(os.path.join(d, ".git")):
+                break
+            parent = os.path.dirname(d)
+            if parent == d:
+                break
+            d = parent
+    return set()
+
+
+def validate_block(obj, idx, schema, cr=False):
+    errs = []
+    if not isinstance(obj, dict):
+        return [f"block {idx}: not a JSON object"]
+    props = schema.get("properties", {})
+
+    # additionalProperties: false — reject unknown keys (e.g. an "evidance" typo)
+    if schema.get("additionalProperties") is False:
+        for k in obj:
+            if k not in props:
+                errs.append(f"block {idx}: unknown key '{k}' (schema forbids additional properties)")
+
+    # required
+    for k in schema.get("required", []):
+        if k not in obj:
+            errs.append(f"block {idx}: missing required field '{k}'")
+
+    # per-property type / enum / minItems / minLength / item-types
+    for k, v in obj.items():
+        spec = props.get(k)
+        if spec is None:
+            continue
+        if "enum" in spec and v not in spec["enum"]:
+            errs.append(f"block {idx}: {k} '{v}' not one of {spec['enum']}")
+        if "type" in spec and not _type_ok(v, spec["type"]):
+            errs.append(f"block {idx}: {k} must be of type {spec['type']}, got {type(v).__name__}")
+            continue  # further checks assume the right type
+        if spec.get("type") == "array":
+            mi = spec.get("minItems")
+            if mi is not None and len(v) < mi:
+                errs.append(f"block {idx}: {k}[] needs at least {mi} item(s)")
+            it = spec.get("items", {}).get("type")
+            if it and not all(_type_ok(i, it) for i in v):
+                errs.append(f"block {idx}: every {k}[] item must be a {it}")
+            ipat = spec.get("items", {}).get("pattern")
+            if ipat is not None:
+                for i in v:
+                    if isinstance(i, str) and re.search(ipat, i) is None:
+                        errs.append(f"block {idx}: every {k}[] item must match /{ipat}/ (e.g. non-blank — a whitespace-only string is not evidence)")
+        if spec.get("type") == "integer":
+            lo, hi = spec.get("minimum"), spec.get("maximum")
+            if lo is not None and v < lo:
+                errs.append(f"block {idx}: {k} must be >= {lo}, got {v}")
+            if hi is not None and v > hi:
+                errs.append(f"block {idx}: {k} must be <= {hi}, got {v}")
+        if k == "standards" and isinstance(v, list):
+            for i, item in enumerate(v):
+                errs.extend(_standards_item_errs(item, idx, i))
+        if spec.get("type") == "string":
+            ml = spec.get("minLength")
+            if ml is not None and len(v) < ml:
+                errs.append(f"block {idx}: {k} must be at least {ml} char(s)")
+            pat = spec.get("pattern")
+            if pat is not None and re.search(pat, v) is None:
+                if k == "evidence" and pat.startswith("^(MEASURED"):
+                    errs.append(f"block {idx}: evidence must open with a provenance label — MEASURED, CITED, "
+                                f"COMPUTED, ESTIMATED or ASSUMED (schema v3.1+) — got '{v[:40]}'")
+                else:
+                    errs.append(f"block {idx}: {k} must match /{pat}/ (e.g. non-blank — not just whitespace)")
+
+    # verdict-conditional rules (schema allOf, hand-applied)
+    v = obj.get("verdict")
+    if v in ("CONCERNS", "FAIL"):
+        c = obj.get("conditions")
+        if not isinstance(c, list) or len(c) == 0:
+            errs.append(f"block {idx}: verdict {v} requires a non-empty conditions[] (array)")
+    if v in ("COULD_NOT_ASSESS", "COULD NOT ASSESS") and not obj.get("reason"):
+        errs.append(f"block {idx}: verdict {v} requires a one-line 'reason' "
+                    f"(what blocked the assessment, and what would unblock it)")
+    if v == "N/A":
+        errs.append(f"block {idx}: 'N/A' is not a verdict in schema v3. A gate that does not apply "
+                    f"emits no verdict block; the Change Record row carries the N/A and its reason.")
+
+    # v3.2 PASS evidence rules (PLAN-WF-2026-10-v2 R3, audit F4). Hand-applied like the rules above;
+    # the same rules are written as allOf entries in verdict-schema.json.
+    ev = obj.get("evidence")
+    if v == "PASS" and isinstance(ev, str):
+        if re.match(r"^ASSUMED\b", ev):
+            errs.append(f"block {idx}: a PASS cannot rest on ASSUMED evidence (schema v3.2) — run or cite "
+                        f"something, or return CONCERNS or COULD NOT ASSESS")
+        elif not re.search(r"\S+:\d+|`[^`]+`", ev):
+            errs.append(f"block {idx}: a PASS needs evidence someone can re-check (schema v3.2) — at least one "
+                        f"path:line reference or a backticked command, got '{ev[:60]}'")
+        agent = str(obj.get("agent") or "").split(":")[-1].strip()
+        if agent in QUALITY_GATES and not (re.match(r"^MEASURED\b", ev) or QUALITY_CITED.match(ev)):
+            errs.append(f"block {idx}: a {agent} PASS must open with MEASURED, or with CITED, completion-auditor's "
+                        f"output path and the backticked command that run executed (schema v3.4) — it rests on "
+                        f"a run, not a trace")
+
+    # v3.3 MEASURED rule (D-146), every verdict: MEASURED evidence names the command it ran, in backticks.
+    # A path:line alone is a citation (CITED); a run outside this session is CITED with its log path.
+    if isinstance(ev, str) and re.match(r"^MEASURED\b", ev) and not re.search(r"`[^`]+`", ev):
+        errs.append(f"block {idx}: MEASURED evidence needs the backticked command that was run (schema v3.3); "
+                    f"a path:line alone is CITED, got '{ev[:60]}'")
+
+    # D-187 re-review: a block that says which sha it re-reviews must name the full sha it now approves.
+    if "rereview_of" in obj:
+        art = obj.get("artifact")
+        if not (isinstance(art, str) and re.search(r"\b[0-9a-f]{40}\b", art)):
+            errs.append(f"block {idx}: a re-review block (rereview_of set) must name the full 40-character "
+                        f"sha it reviewed in artifact, got '{str(art)[:60]}'")
+
+    # D-192 (audit 3 G9): only a gate (or a council seat) signs a verdict block; a producer's self-signed
+    # PASS is not a gate's verdict. The roster is the schema's `gates` list.
+    if isinstance(schema.get("gates"), list) and isinstance(obj.get("agent"), str):
+        slug = obj["agent"].split(":")[-1].strip()
+        # D-198 (audit 3 re-check H1): a Change Record is signed by gates only; council seats sign seat blocks
+        # in the plain mode (the council skill's check), never a CR gate row.
+        signers = set(schema["gates"]) | _allowed_gates() | (set() if cr else set(schema.get("council_seats") or []))
+        if slug and slug not in signers:
+            errs.append(f"block {idx}: not a gate agent: {slug} (only a gate or a council seat signs a verdict "
+                        f"block; a project gate goes in .claude/gates-allow.txt)" if not cr else
+                        f"block {idx}: not a gate agent: {slug} (a Change Record is signed by gates only; a project "
+                        f"gate goes in .claude/gates-allow.txt)")
+
+    # anti-rubber-stamp: reject the unmodified CR-template placeholder strings
+    for field in ("artifact", "falsifier"):
+        val = obj.get(field)
+        if isinstance(val, str) and val.strip() in TEMPLATE_PLACEHOLDERS:
+            errs.append(f"block {idx}: {field} is an unfilled template placeholder ('{val}')")
+    ev = obj.get("evidence")
+    if isinstance(ev, str) and ev.strip() in TEMPLATE_PLACEHOLDERS:
+        errs.append(f"block {idx}: evidence is an unfilled template placeholder ('{ev}')")
+    elif isinstance(ev, list):
+        # schema v2 shipped evidence as an array. Name the migration rather than failing on a
+        # bare type error, so a stale gate body gets a fixable message.
+        errs.append(f"block {idx}: evidence must be a string in schema v3 (it was an array in v2) "
+                    f"— join the citations into one line")
+    return errs
+
+
+def aggregate_state(verdicts):
+    """The aggregate gate state over a list of verdict strings. COULD_NOT_ASSESS (the canonical
+    machine form) is normalised to the spaced form first (2.3.2, audit F8): without that, a file whose
+    only blocker was COULD_NOT_ASSESS reported HAS_CONCERNS."""
+    verdicts = ["COULD NOT ASSESS" if v == "COULD_NOT_ASSESS" else v for v in verdicts]
+    # N/A is neutral (gate does not apply); COULD NOT ASSESS is BLOCKING — it stays in non_na
+    non_na = [v for v in verdicts if v != "N/A"]
+    if not non_na:
+        return "N/A"
+    if all(v == "PASS" for v in non_na):
+        return "ALL_PASS"
+    if any(v == "FAIL" for v in non_na):
+        return "HAS_FAIL"
+    if any(v == "COULD NOT ASSESS" for v in non_na):
+        return "HAS_COULD_NOT_ASSESS"
+    return "HAS_CONCERNS"
+
+
+# D-212: words that stand in for a value without giving one.
+NOT_FILLED = {"n/a", "na", "none", "tbd", "?", "pending", "todo"}
+
+
+def _filled(cell):
+    """A §5 cell holds something: not blank, not only template fill marks (___, -, —), and not a stand-in
+    word (n/a, na, none, tbd, ?, pending, todo; any case; D-212)."""
+    c = re.sub(r"[*`]", "", cell or "").strip()
+    if not re.sub(r"[\s_\-—.]", "", c):
+        return False
+    return c.lower().strip(" .") not in NOT_FILLED
+
+
+def section5_rows(text, agent_slugs=()):
+    """--cr-mode (D-202, D-212): [(lowercased What, accepts)] for each §5 row. Columns are found by the
+    header row ("What", "I decided", "Why acceptable", "Approver"; `*`, backticks and spaces in a header cell
+    are ignored). A row accepts only when "I decided" is ACCEPT-WITH-RISK or HUMAN-OVERRULES, "Why
+    acceptable" and "Approver" are filled, and the Approver is not an agent (a gate or council slug). A table
+    with no Approver column (the 2.8.2 template) has no accepting row."""
+    m = re.search(r"^##\s*5\.[^\n]*\n(.*?)(?=^##\s|\Z)", text, re.S | re.M)
+    if not m:
+        return []
+    header, out = None, []
+    for line in m.group(1).splitlines():
+        if not line.strip().startswith("|"):
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if all(re.match(r"^:?-+:?$", c) for c in cells if c):
+            continue                       # the |---|---| separator (or an empty row)
+        if header is None:
+            header = [re.sub(r"[*`\s]", "", c).lower() for c in cells]
+            continue
+        col = lambda pred: next((i for i, h in enumerate(header) if pred(h)), None)
+        i_what, i_dec = col(lambda h: h == "what"), col(lambda h: "decided" in h or "decision" in h)
+        i_why, i_appr = col(lambda h: h.startswith("why") or "justification" in h), col(lambda h: "approver" in h)
+        if i_what is None:
+            return []
+        get = lambda i: cells[i] if i is not None and i < len(cells) else ""
+        if not _filled(get(i_what)):
+            continue
+        appr = re.sub(r"[*`\s]", "", get(i_appr)).lower().split(":")[-1]
+        accepts = (None not in (i_dec, i_why, i_appr)
+                   and re.sub(r"[*`\s]", "", get(i_dec)).upper() in ACCEPTING and _filled(get(i_why))
+                   and _filled(get(i_appr)) and appr not in agent_slugs)
+        out.append((get(i_what).lower(), accepts))
+    return out
+
+
+def uncovered_blockers(text, blocks, schema=None):
+    """--cr-mode: the FAIL / COULD NOT ASSESS blocks that §5 does not accept (D-202, D-212). The gate is
+    named by its `gate` or `agent` value (or the agent's slug after a plugin prefix) as a whole word: a
+    hyphen or letter on either side is part of another name, so `security` does not match
+    `security-operations`. A blocker is covered only when at least one row names it and every row that
+    names it accepts."""
+    slugs = set((schema or {}).get("gates") or []) | set((schema or {}).get("council_seats") or [])
+    rows = section5_rows(text, slugs)
+    out = []
+    for b in blocks:
+        if not isinstance(b, dict) or aggregate_state([b.get("verdict")]) not in ("HAS_FAIL", "HAS_COULD_NOT_ASSESS"):
+            continue
+        names = {str(b.get(k) or "").strip().lower() for k in ("gate", "agent")}
+        names |= {n.split(":")[-1].strip() for n in names}
+        names -= {""}
+        pats = [re.compile(r"(?<![a-z0-9_-])" + re.escape(n) + r"(?![a-z0-9_-])") for n in names]
+        naming = [acc for what, acc in rows if any(p.search(what) for p in pats)]
+        if not (naming and all(naming)):
+            out.append(b)
+    return out
+
+
+def self_test():
+    """Run the fixture set. A validator nobody tests is a claim, not a control.
+
+    fixtures/EXPECTATIONS.json records the intended outcome per fixture; every valid fixture must
+    pass and every invalid one must fail. A silently-loosened rule shows up here as a fixture that
+    stopped failing."""
+    fx = SCHEMA_PATH.parent / "fixtures"
+    exp_path = fx / "EXPECTATIONS.json"
+    if not exp_path.exists():
+        print("FATAL: no fixtures/EXPECTATIONS.json", file=sys.stderr)
+        return 2
+    expectations = json.loads(exp_path.read_text())
+    schema = load_schema()
+    bad = 0
+    for name in sorted(expectations):
+        want = expectations[name]
+        # An expectation is "PASS"/"FAIL", or {"valid": "PASS"|"FAIL", "state": "<aggregate>"} for a
+        # fixture that also pins the aggregate state (2.3.2, audit F8).
+        want_state = want.get("state") if isinstance(want, dict) else None
+        want = want["valid"] if isinstance(want, dict) else want
+        text = (fx / name).read_text()
+        errs, verdicts = [], []
+        for i, raw in enumerate(FENCE.findall(text), 1):
+            try:
+                obj = json.loads(raw)
+            except json.JSONDecodeError as e:
+                errs.append(f"block {i}: invalid JSON ({e})")
+                continue
+            errs.extend(validate_block(obj, i, schema))
+            if isinstance(obj, dict) and obj.get("verdict"):
+                verdicts.append(obj["verdict"])
+        got = "FAIL" if errs else "PASS"
+        ok = (got == want)
+        if want_state is not None:
+            got_state = aggregate_state(verdicts)
+            if got_state != want_state:
+                ok = False
+                errs.append(f"aggregate state {got_state}, expected {want_state}")
+        bad += 0 if ok else 1
+        print(f"  {'ok  ' if ok else 'BAD '} {name:<42} want {want:<4} got {got}")
+        if not ok:
+            for e in errs:
+                print(f"         {e}")
+        elif want == "FAIL":
+            print(f"         caught: {errs[0]}")
+    # --cr-mode fixtures (D-118): fixtures/cr-*.md with fixtures/CR-EXPECTATIONS.json -> expected rc.
+    cr_exp_path = fx / "CR-EXPECTATIONS.json"
+    cr_exp = json.loads(cr_exp_path.read_text()) if cr_exp_path.exists() else {}
+    for name in sorted(cr_exp):
+        want = cr_exp[name]
+        got = cr_mode_rc((fx / name).read_text(), schema)
+        ok = (got == want)
+        bad += 0 if ok else 1
+        print(f"  {'ok  ' if ok else 'BAD '} {name:<42} want rc {want:<2} got rc {got}")
+    # D-204, D-213 (the allow-file walk stays inside the repo): where the allow file sits, CLAUDE_PROJECT_DIR and
+    # the working directory, each relative to <tmp>/outer with the repo at outer/repo; want "reject" or "accept".
+    scenarios = [
+        ("(D-204) allow file above-repo", "outer", ".git dir", "outer/repo", "outer/repo", "reject"),
+        ("(D-204) allow file in-repo", "outer/repo", ".git dir", "outer/repo", "outer/repo", "accept"),
+        ("(D-213) dangling .git link stops walk", "outer", ".git dangling link", "outer/repo", "outer/repo", "reject"),
+        ("(D-213) env outside the repo", "outer/other", ".git dir", "outer/other", "outer/repo", "reject"),
+        ("(D-213) env at the repo's parent", "outer", ".git dir", "outer", "outer/repo", "reject"),
+        ("(D-213) env at the repo root, cwd below", "outer/repo", ".git dir", "outer/repo", "outer/repo/src", "accept"),
+    ]
+    allow_cases = 0
+    for name, home_rel, git_kind, env_rel, cwd_rel, want in scenarios:
+        allow_cases += 1
+        with tempfile.TemporaryDirectory() as tmp:
+            base = os.path.realpath(tmp)
+            repo = os.path.join(base, "outer", "repo")
+            for d in ("outer/repo/src", "outer/other"):
+                os.makedirs(os.path.join(base, d), exist_ok=True)
+            if git_kind == ".git dir":
+                os.makedirs(os.path.join(repo, ".git"))
+            else:
+                os.symlink(os.path.join(base, "no-such-gitdir"), os.path.join(repo, ".git"))
+            home = os.path.join(base, home_rel)
+            os.makedirs(os.path.join(home, ".claude"), exist_ok=True)
+            with open(os.path.join(home, ".claude", "gates-allow.txt"), "w", encoding="utf-8") as f:
+                f.write("acme-project-gate\n")
+            obj = json.loads(FENCE.findall((fx / "valid-pass.md").read_text())[0])
+            obj["agent"] = "acme-project-gate"
+            cwd, env = os.getcwd(), os.environ.get("CLAUDE_PROJECT_DIR")
+            try:
+                os.environ["CLAUDE_PROJECT_DIR"] = os.path.join(base, env_rel)
+                os.chdir(os.path.join(base, cwd_rel))
+                errs = validate_block(obj, 1, schema)
+            finally:
+                os.chdir(cwd)
+                if env is None:
+                    os.environ.pop("CLAUDE_PROJECT_DIR", None)
+                else:
+                    os.environ["CLAUDE_PROJECT_DIR"] = env
+        rejected = any("not a gate agent: acme-project-gate" in e for e in errs)
+        ok = (rejected == (want == "reject"))
+        bad += 0 if ok else 1
+        print(f"  {'ok  ' if ok else 'BAD '} {name:<42} want {want} got {'reject' if rejected else 'accept'}")
+        if not ok:
+            for e in errs:
+                print(f"         {e}")
+    total = len(expectations) + len(cr_exp) + allow_cases
+    print(f"\n  {total - bad}/{total} fixtures behaved as expected")
+    return 1 if bad else 0
+
+
+def cr_mode_rc(text, schema, report=None):
+    """The --cr-mode exit code for a Change Record's text (0 pass, 1 fail, 3 no blocks)."""
+    raw_blocks = FENCE.findall(text)
+    if not raw_blocks:
+        return 3
+    blocks, errs = [], []
+    for i, raw in enumerate(raw_blocks, 1):
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError as e:
+            errs.append(f"block {i}: invalid JSON — {e}")
+            continue
+        errs += validate_block(obj, i, schema, cr=True)
+        blocks.append(obj)
+    unc = uncovered_blockers(text, blocks, schema)
+    if report is not None:
+        report["errors"], report["uncovered"] = errs, unc
+    return 1 if (errs or unc) else 0
+
+
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    flags = {a for a in sys.argv[1:] if a.startswith("--")}
+    if "--self-test" in flags:
+        return self_test()
+    if not args:
+        print("usage: validate_verdict.py <file.md> [--require] [--json] | --self-test",
+              file=sys.stderr)
+        return 2
+    schema = load_schema()
+    text = Path(args[0]).read_text()
+    if "--cr-mode" in flags:
+        rep = {}
+        rc = cr_mode_rc(text, schema, rep)
+        if rc == 3:
+            print("no ```verdict blocks found (required!)")
+            return 3
+        for e in rep["errors"]:
+            print(f"  ERROR: {e}")
+        for b in rep["uncovered"]:
+            print(f"  ERROR: gate '{b.get('gate')}' ({b.get('agent')}) returned {b.get('verdict')} and no row in "
+                  f"'## 5. Deviations & risk acceptance' accepts it (What names the gate, I decided is "
+                  f"ACCEPT-WITH-RISK or HUMAN-OVERRULES, Why acceptable and Approver filled) — rework, or "
+                  f"record the human risk acceptance there")
+        if rc == 0:
+            print("  OK — verdict blocks well-formed; every FAIL / COULD NOT ASSESS gate has a §5 risk-acceptance row.")
+        return rc
+    raw_blocks = FENCE.findall(text)
+
+    if not raw_blocks:
+        msg = {"blocks": 0, "ok": "--require" not in flags, "errors": ["no ```verdict blocks found"]}
+        if "--json" in flags:
+            print(json.dumps(msg))
+        else:
+            print("no ```verdict blocks found" + (" (required!)" if "--require" in flags else ""))
+        return 3 if "--require" in flags else 0
+
+    all_errs, verdicts = [], []
+    for i, raw in enumerate(raw_blocks, 1):
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError as e:
+            all_errs.append(f"block {i}: invalid JSON — {e}")
+            continue
+        all_errs += validate_block(obj, i, schema)
+        if isinstance(obj, dict) and obj.get("verdict"):
+            verdicts.append(obj["verdict"])
+
+    state = aggregate_state(verdicts)
+
+    report = {"blocks": len(raw_blocks), "verdicts": verdicts, "state": state,
+              "ok": not all_errs, "errors": all_errs}
+    if "--json" in flags:
+        print(json.dumps(report, indent=2))
+    else:
+        print(f"{len(raw_blocks)} verdict block(s) · aggregate: {state}")
+        for e in all_errs:
+            print(f"  ERROR: {e}")
+        if state == "HAS_FAIL":
+            print("  NOTE: a FAIL is present — merge requires a §5 human risk-acceptance to overrule.")
+        if state == "HAS_COULD_NOT_ASSESS":
+            print("  NOTE: a COULD NOT ASSESS is present — BLOCKING; the gate must be re-run or the artifact reduced. completion-auditor treats it as not-done.")
+        if not all_errs:
+            print("  OK — all verdict blocks well-formed.")
+    return 1 if all_errs else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
