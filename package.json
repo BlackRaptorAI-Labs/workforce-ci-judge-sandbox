@@ -1,0 +1,11 @@
+{
+  "name": "sandbox-monorepo",
+  "private": true,
+  "packageManager": "pnpm@9.15.9",
+  "scripts": {
+    "test": "turbo test"
+  },
+  "devDependencies": {
+    "vitest": "3.2.7"
+  }
+}

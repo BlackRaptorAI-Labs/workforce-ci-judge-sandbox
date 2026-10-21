@@ -1,5 +1,9 @@
 {
   "schema": 1,
   "mode": "plugin",
-  "test_cmd": "python3 -m pytest -q"
+  "test_cmd": [
+    "python3 -m pytest -q",
+    "npx vitest run --root packages/a",
+    "npx vitest run --root packages/b"
+  ]
 }
