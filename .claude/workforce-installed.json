@@ -13,7 +13,7 @@
   ],
   "date": "2026-10-21",
   "packs": {
-    "core": "2.8.3",
+    "core": "2.8.2",
     "engineering": "2.8.3"
   },
   "pack_roots_seen": [
