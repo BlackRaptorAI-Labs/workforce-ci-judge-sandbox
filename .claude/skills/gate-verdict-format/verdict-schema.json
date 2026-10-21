@@ -1,0 +1,126 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Gate verdict block",
+  "x-schema-version": "3.4",
+  "x-version-note-3.4": "MINOR bump 2026-10-19 (v3.3->v3.4, D-201, amends D-101 and D-181). A content rule on an existing field, no new field: a test-auditor or completion-auditor PASS opens with MEASURED, or with CITED followed by completion-auditor's output path and the backticked command that run executed. A reviewer without Bash can now pass on the completion audit's run. The Stop hook checks that the cited command ran in this session (by any agent), as it does for MEASURED.",
+  "x-version-note-3.3": "MINOR bump 2026-10-12 (v3.2->v3.3, D-146). A content rule on an existing field, no new field: `evidence` that opens with MEASURED must contain at least one backticked command, for every verdict. A MEASURED line with only a `path:line` is CITED. A run that happened outside this session (CI, another terminal) is CITED with its log path, never MEASURED. The Stop hook also checks that a backticked MEASURED command was actually run in the session.",
+  "x-version-note-3.2": "MINOR bump 2026-10-09 (v3.1->v3.2, PLAN-WF-2026-10-v2 R3, audit F4). A content rule on an existing field, no new field: a PASS needs `evidence` that opens with MEASURED, CITED, COMPUTED or ESTIMATED (never ASSUMED) and contains at least one `path:line` reference or a backticked command. For `test-auditor` and `completion-auditor` a PASS must open with MEASURED. A bare label (`MEASURED`) or a hand-trace with nothing to re-check no longer carries a PASS. CONCERNS, FAIL and COULD NOT ASSESS are unchanged.",
+  "x-version-note-3.1": "MINOR bump 2026-10-02 (v3.0->v3.1, D-101). One content rule on an existing field, no new field: `evidence` must open with one of the five provenance labels the core contract already defines (MEASURED, CITED, COMPUTED, ESTIMATED, ASSUMED), so a hand-traced result (COMPUTED or ASSUMED) can never pass as an executed one (MEASURED). Blocks that were valid v3.0 fail v3.1 only if their evidence lacks the label.",
+  "x-version-note": "MAJOR bump 2026-09-02 (v2->v3), AGENT-SPEC-v3 §7 / BUILD-ORDER-v4 D1. THREE BREAKING CHANGES. (1) `confidence` is an INTEGER 0-10, replacing the high|medium|low enum, so a Change Record and the completion auditor can set a threshold on it — you cannot write `confidence >= 7` against a word. (2) `standards[]` is new and REQUIRED: a gate that invokes a designation now records how it reached it and when it verified it, or states plainly that no standard governs the review. Spec §7 required a Standards line for a year and the schema had no field for it, so it was never enforced. (3) `N/A` is removed from the verdict vocabulary: a gate that does not apply emits no verdict block, and the Change Record row carries the N/A. `evidence` becomes a single string. The verdict schema is a declared interface (AGENT-SPEC §12.4); this is a coordinated major version across all five plugins, shipping as 2.0.0.",
+  "description": "The single machine-parseable verdict every gate agent emits, fenced as a ```verdict code block alongside its human-readable prose. validate_verdict.py enforces it, the change-record-required CI check shells out to that validator, and the core Stop hook runs it over every gate result in a live session.",
+  "type": "object",
+  "x-roster-note": "D-192 (2.8.2, audit 3 G9): the ONE gate roster. verify.sh, the core Stop hook and validate_verdict.py read `gates` from here. Only an agent on `gates` or `council_seats` (a council seat, whose block the council skill validates; not a gate) may sign a verdict block; a project adds its own gates to .claude/gates-allow.txt, one slug per line.",
+  "gates": ["code-reviewer", "security-architect", "red-team-reviewer", "compliance-officer", "domain-compliance", "privacy-counsel", "operational-readiness", "completion-auditor", "ux-designer", "ethics-governance", "evidence-auditor", "compliance-cert", "hw-design-reviewer", "claims-gate", "schema-reviewer", "test-auditor", "infra-reviewer"],
+  "council_seats": ["coo", "finance", "fundraising-ir", "growth-engine", "gtm-strategy", "market-insight", "people-org", "pricing-strategy", "revenue", "technology-strategy", "product-manager"],
+  "additionalProperties": false,
+  "required": ["gate", "agent", "artifact", "verdict", "evidence", "confidence", "falsifier", "standards"],
+  "properties": {
+    "gate": {
+      "type": "string",
+      "pattern": "\\S",
+      "description": "the gate role this verdict fills, e.g. 'security', 'privacy', 'schema', 'quality', 'review'"
+    },
+    "agent": {
+      "type": "string",
+      "pattern": "\\S",
+      "description": "the gate agent that produced it, e.g. 'security-architect'"
+    },
+    "artifact": {
+      "type": "string",
+      "pattern": "\\S",
+      "description": "what was reviewed — PR ref and/or file/diff range"
+    },
+    "verdict": {
+      "enum": ["PASS", "CONCERNS", "FAIL", "COULD_NOT_ASSESS", "COULD NOT ASSESS"],
+      "description": "PASS = accept-eligible. CONCERNS = accept once the listed conditions are met. FAIL = rework, or a documented human risk-acceptance to overrule. COULD_NOT_ASSESS = the gate ran but could not complete its assessment (timeout, context exhausted on a large artifact, a required input absent) — BLOCKING, never neutral: without it a review that could not be performed is indistinguishable from a pass. The canonical machine form is COULD_NOT_ASSESS; the spaced form is accepted because that is how it reads in prose and in every gate body, and a live Stop hook must never block a gate over a space. N/A is NOT a verdict: a gate that does not apply emits no block at all, and the Change Record row carries the N/A with its reason."
+    },
+    "confidence": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 10,
+      "description": "how strongly the evidence supports this verdict, 0-10. An integer so thresholds are expressible. Not a probability, and not a measure of how thorough the review felt."
+    },
+    "falsifier": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S",
+      "description": "the single fact or test that, if true, would flip this verdict. Non-blank. A verdict nobody can refute is an opinion."
+    },
+    "evidence": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(MEASURED|CITED|COMPUTED|ESTIMATED|ASSUMED)\\b",
+      "description": "the concrete basis, opening with its provenance label (v3.1; v3.2 adds the PASS rule in allOf): MEASURED (you ran it in this session; name the command in backticks, v3.3), CITED (path:line@sha plus the exact quote, or a fetched URL plus the quote), COMPUTED (derived by tracing or arithmetic), ESTIMATED, or ASSUMED. Then path:line@sha and the exact quote, or the measurement."
+    },
+    "standards": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Every standard, statute or specification this verdict rests on, or a single literal 'none: practice applied: <x>' when no external standard governs the review. A designation with no access and no verification date is a memory, not a citation.",
+      "items": {
+        "oneOf": [
+          {
+            "type": "string",
+            "pattern": "^none: practice applied: \\S"
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["designation", "edition", "clause", "access", "verified"],
+            "properties": {
+              "designation": {"type": "string", "pattern": "\\S", "description": "e.g. 'ISO/IEC 27001'"},
+              "edition": {"type": "string", "pattern": "\\S", "description": "the edition or year actually consulted"},
+              "clause": {"type": "string", "pattern": "\\S", "description": "the clause, control or section relied on"},
+              "access": {"type": "string", "pattern": "\\S", "description": "how you reached the text: 'full text', 'abstract only', 'secondary source: <which>', 'not reached'"},
+              "verified": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$", "description": "YYYY-MM-DD the designation and clause were checked at the issuing body"}
+            }
+          }
+        ]
+      }
+    },
+    "conditions": {
+      "type": "array",
+      "items": {"type": "string", "pattern": "\\S"},
+      "description": "specific, testable conditions to clear — REQUIRED and non-empty when verdict is CONCERNS or FAIL. 'Tighten this up' is not a condition."
+    },
+    "rereview_of": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{7,40}$",
+      "description": "optional (D-187): on a re-review of a fix, the sha last reviewed. When present, `artifact` must name the full 40-character sha now reviewed."
+    },
+    "reason": {
+      "type": "string",
+      "pattern": "\\S",
+      "description": "one line of why — REQUIRED when the verdict is COULD_NOT_ASSESS (what blocked the assessment, and what would unblock it)"
+    }
+  },
+  "allOf": [
+    {
+      "x-rule": "D-187 re-review: with rereview_of, the artifact names the full 40-character sha reviewed",
+      "if": {"required": ["rereview_of"]},
+      "then": {"properties": {"artifact": {"pattern": "\\b[0-9a-f]{40}\\b"}}}
+    },
+    {
+      "if": {"properties": {"verdict": {"enum": ["CONCERNS", "FAIL"]}}},
+      "then": {"required": ["conditions"], "properties": {"conditions": {"minItems": 1}}}
+    },
+    {
+      "if": {"properties": {"verdict": {"enum": ["COULD_NOT_ASSESS", "COULD NOT ASSESS"]}}},
+      "then": {"required": ["reason"]}
+    },
+    {
+      "x-rule": "v3.2 PASS evidence: a non-ASSUMED label and at least one path:line or backticked command",
+      "if": {"properties": {"verdict": {"const": "PASS"}}, "required": ["verdict"]},
+      "then": {"properties": {"evidence": {"pattern": "^(MEASURED|CITED|COMPUTED|ESTIMATED)\\b(?=[\\s\\S]*(\\S+:\\d+|`[^`]+`))"}}}
+    },
+    {
+      "x-rule": "v3.3 MEASURED evidence names the command that was run: at least one backticked command",
+      "if": {"properties": {"evidence": {"type": "string", "pattern": "^MEASURED\\b"}}, "required": ["evidence"]},
+      "then": {"properties": {"evidence": {"pattern": "^MEASURED\\b[\\s\\S]*`[^`]+`"}}}
+    },
+    {
+      "x-rule": "v3.4 quality gates: a test-auditor or completion-auditor PASS opens with MEASURED, or with CITED, the completion audit's output path and the backticked command it ran",
+      "if": {"properties": {"verdict": {"const": "PASS"}, "agent": {"enum": ["test-auditor", "completion-auditor"]}}, "required": ["verdict", "agent"]},
+      "then": {"properties": {"evidence": {"pattern": "^(MEASURED\\b|CITED\\s+[^\\s`]*[/.][^\\s`]*\\s+`[^`]+`)"}}}
+    }
+  ]
+}

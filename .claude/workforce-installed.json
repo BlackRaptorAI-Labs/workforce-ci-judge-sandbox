@@ -1,9 +1,168 @@
 {
   "schema": 1,
   "mode": "plugin",
+  "sandbox": true,
+  "marketplace": [
+    "blackraptor-scratch",
+    {
+      "source": {
+        "source": "directory",
+        "path": "/private/var/folders/hb/vt7c2wg548j8v3r294x428vh0000gn/T/br-scratch-marketplace"
+      }
+    }
+  ],
+  "date": "2026-10-21",
+  "packs": {
+    "core": "2.8.3",
+    "engineering": "2.8.3"
+  },
+  "pack_roots_seen": [
+    "core",
+    "engineering"
+  ],
+  "files": {
+    ".claude/hooks/protect-tier3.py": {
+      "sha256": "e8e37adfc068d89b9a86df99d6f7fcfc2c09931ae44baa8dc13394d34568da59",
+      "owned": true,
+      "kind": "file",
+      "from": "engineering/claude/hooks/protect-tier3.py"
+    },
+    ".claude/live-commands-allow.txt": {
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "owned": true,
+      "kind": "file",
+      "from": "workforce-init live-command allow list (empty)"
+    },
+    ".claude/skills/gate-verdict-format/validate_verdict.py": {
+      "sha256": "ab02c8d24ab47e0049d1a576ee2591d1e2cf78ab85a53fe454af9e476e3bd294",
+      "owned": true,
+      "kind": "file",
+      "from": "core/skills/gate-verdict-format/validate_verdict.py"
+    },
+    ".claude/skills/gate-verdict-format/verdict-schema.json": {
+      "sha256": "25fcb7c2b1cc7c9231dc167ff40ee67c8a848ef87c6cb5b3b8d4ab9b75086589",
+      "owned": true,
+      "kind": "file",
+      "from": "core/skills/gate-verdict-format/verdict-schema.json"
+    },
+    ".github/workflows/change-record-required.yml": {
+      "sha256": "2875d5c9129c15df0e2e67c57e5d0b94681d332ab84e94604b36c7b05d7c9665",
+      "owned": true,
+      "kind": "file",
+      "from": "engineering/github/change-record-required.yml"
+    },
+    ".github/workflows/workforce-proof.yml": {
+      "sha256": "c234ad4fe8b9a1380e081fb70659d947595eb98734c22fb1630dd8574be14807",
+      "owned": false,
+      "kind": "file",
+      "from": "engineering/github/workforce-proof.yml"
+    },
+    ".claude/settings.json": {
+      "kind": "json-merge",
+      "owned": false,
+      "ops": [
+        [
+          "set",
+          [
+            "hooks"
+          ],
+          {
+            "PreToolUse": [
+              {
+                "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash",
+                "hooks": [
+                  {
+                    "type": "command",
+                    "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/protect-tier3.py\""
+                  }
+                ]
+              }
+            ]
+          }
+        ],
+        [
+          "set",
+          [
+            "sandbox"
+          ],
+          {
+            "enabled": true,
+            "failIfUnavailable": true,
+            "allowUnsandboxedCommands": false,
+            "filesystem": {
+              "allowWrite": [
+                "./"
+              ],
+              "denyWrite": [
+                "./.claude/gates-allow.txt",
+                "./.claude/test-summary-patterns.txt",
+                "./.claude/live-commands-allow.txt",
+                "./.claude/workforce-installed.json",
+                "./.claude/review-copies.sha256",
+                "./.github/workflows/change-record-required.yml",
+                "./.github/workflows/workforce-proof.yml"
+              ]
+            }
+          }
+        ],
+        [
+          "set",
+          [
+            "extraKnownMarketplaces"
+          ],
+          {
+            "blackraptor-scratch": {
+              "source": {
+                "source": "directory",
+                "path": "/private/var/folders/hb/vt7c2wg548j8v3r294x428vh0000gn/T/br-scratch-marketplace"
+              }
+            }
+          }
+        ]
+      ],
+      "sha256": "6482c4f9b4b4017598ef2c5abc8410182b7ae10e3d5ac04d8a05c7650b1c1ea0",
+      "original": "{\n  \"enabledPlugins\": {\n    \"blackraptor-core@blackraptor-scratch\": true,\n    \"blackraptor-engineering@blackraptor-scratch\": true,\n    \"blackraptor-core@blackraptor\": false,\n    \"blackraptor-engineering@blackraptor\": false,\n    \"blackraptor-council@blackraptor\": false,\n    \"blackraptor-marketing@blackraptor\": false,\n    \"blackraptor-hardware@blackraptor\": false\n  }\n}\n"
+    },
+    ".gitignore": {
+      "kind": "gitignore-lines",
+      "owned": false,
+      "lines": [
+        ".claude/hooks/tier3-attempts.log"
+      ],
+      "added": ".claude/hooks/tier3-attempts.log\n",
+      "sha256": "d7891aa09f734794d253166b2aaae49953118de225403dd444a257e6bad17b9d"
+    },
+    "BUSINESS-CONTEXT.md": {
+      "kind": "context-rows",
+      "owned": true,
+      "rows": [
+        "| TEST_CMD | python3 -m pytest -q ; npx vitest run --root packages/a ; npx vitest run --root packages/b |\n"
+      ],
+      "sha256": "fa55e6c346e6e015be500df0dd5ec30ee00c71750be909130e0d8fafca2b1d7e"
+    }
+  },
+  "skipped": [],
+  "made_dirs": [
+    ".claude/hooks",
+    ".claude/skills",
+    ".claude/skills/gate-verdict-format"
+  ],
+  "core_root": "/Users/blackraptorai/.claude/plugins/cache/blackraptor-scratch/blackraptor-core/2.8.3",
   "test_cmd": [
     "python3 -m pytest -q",
     "npx vitest run --root packages/a",
     "npx vitest run --root packages/b"
-  ]
+  ],
+  "test_timeout": 300,
+  "test_globs": [
+    "tests/**",
+    "test/**",
+    "**/tests/**",
+    "**/test_*.py",
+    "**/*_test.py",
+    "**/*.test.*",
+    "**/*.spec.*",
+    "**/__tests__/**"
+  ],
+  "engineering_root": "/Users/blackraptorai/.claude/plugins/cache/blackraptor-scratch/blackraptor-engineering/2.8.3"
 }
