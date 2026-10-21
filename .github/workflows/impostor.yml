@@ -1,0 +1,15 @@
+name: impostor
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  head-suite:
+    name: head-suite
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo pass
+  base-suite:
+    name: base-suite
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo pass
