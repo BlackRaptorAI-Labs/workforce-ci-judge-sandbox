@@ -1,6 +1,7 @@
 # workforce-proof (BlackRaptor Workforce engineering pack, 2.8.3, D-251): CI is the judge of whether the tests pass.
 #
-# Installed by /workforce-init as .github/workflows/workforce-proof.yml. Two jobs, both required by branch protection:
+# Installed by /workforce-init as .github/workflows/workforce-proof.yml. Two jobs; make both required checks on the default
+# branch (/workforce-init --setup-branch-protection, from your own terminal):
 #   head-suite  the commit as pushed: environment folders deleted, dependencies installed only from the lockfile, every
 #               recorded test command (`test_cmd` in .claude/workforce-installed.json at the merge base) run with its
 #               runner's machine report.
@@ -9,8 +10,8 @@
 #               the new code, so a forged conftest, pytest.ini, test file or environment cannot carry it.
 # Each job fails unless every command exits 0 with at least 1 passed and 0 failed or errored by its report.
 # The Stop hook reads these two check runs for the exact commit (github-actions app, this workflow's check suite) and
-# checks this file against the hash /workforce-init recorded. Do not edit it in a pull request: CODEOWNERS and branch
-# protection keep it a person's decision, and the hook blocks a changed copy.
+# checks this file against the hash /workforce-init recorded. Do not edit it in a pull request: with branch protection set
+# up the owner approves every change to it, and the hook blocks a changed copy.
 # No secrets, no cache, no pull_request_target; read-only token.
 name: workforce-proof
 on:
@@ -387,8 +388,9 @@ env:
         base = git("merge-base", want_base, head).strip()
         rec_raw = show(base, REC)
         source = "the merge base"
-        if rec_raw is None:
-            rec_raw, source = show(head, REC), "this commit (the merge base has no install record)"
+        if rec_raw is None:     # D-261: never the change's own record; the owner reviews the first Workforce pull request
+            raise SystemExit("FAIL: base branch has no Workforce install record; the first Workforce pull request is approved "
+                             "by the owner on review, not by CI")
         try:
             rec = json.loads(rec_raw.decode("utf-8")) if rec_raw else {}
         except ValueError:
@@ -409,10 +411,9 @@ env:
                         named.add(os.path.normpath(tok))
         if MODE == "base":
             n_base_tests = put_back_base(base, globs, named)
-            if n_base_tests == 0:
-                say("base: the merge base has no test files; nothing to judge the change against (head-suite still runs)")
+            if n_base_tests == 0:   # D-261: no free pass; the owner's review decides this pull request
                 open(os.path.join(REPORTS, "summary.json"), "w").write(json.dumps({"mode": MODE, "result": "no base tests"}))
-                return 0
+                raise SystemExit("FAIL: no base tests to run; the owner's review decides this pull request")
         env = install()
         ok, total_p, total_f = True, 0, 0
         for i, c in enumerate(cmds):
